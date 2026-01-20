@@ -1,3 +1,9 @@
+# Amplifier repos (keep local, don't push to remote)
+amplifier/
+amplifier-core/
+amplifier-foundation/
+.gitmodules
+
 # Secrets - NEVER commit these
 *.env
 !*.env.template
