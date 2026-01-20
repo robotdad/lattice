@@ -1,10 +1,24 @@
-# Lattice
+# Lattice of Coincidences
+
+![Miller from Repo Man](images/miller.jpg)
+
+*Photo: Tracey Walter by David Zaugh, [CC BY-SA 2.5](https://creativecommons.org/licenses/by-sa/2.5/)*
 
 > "A lot of people don't realize what's really going on. They view life as a bunch of unconnected incidents and things. They don't realize that there's this lattice of coincidence that lies on top of everything."
 > 
 > — Miller, *Repo Man* (1984)
 
-**Multi-agent collaboration via Microsoft 365 infrastructure.**
+---
+
+## The Coincidence
+
+At a team hackathon, we each set up our own M365 test tenant, fired up [Amplifier](https://github.com/microsoft/amplifier), and gave it the same prompt:
+
+> "Hi, I just got you an M365 test tenant. I'm going to want you to be able to log in via the admin account I created for you, but you don't have the code tools etc to do it, so you'll have to start by building yourself those things. I can restart your service after you create any custom modules, bundles, etc. so that you can use them. Collaborate with your agents to design and implement enough to get connected."
+
+From there, we each worked with Amplifier to configure our tenants, grant access, and explore what's possible when AI agents have their own M365 environment. Each of us ran in different directions—and this repo captures one of those explorations: a *Repo Man*-inspired multi-agent collaboration system.
+
+The lattice of coincidence, indeed.
 
 ---
 
@@ -23,7 +37,7 @@ Use at your own risk. This is a proof-of-concept exploring how AI agents can col
 
 ## What Is This?
 
-Lattice enables multiple [Amplifier](https://github.com/microsoft/amplifier) AI agent sessions to collaborate using Microsoft 365 services:
+Lattice enables multiple Amplifier AI agent sessions to collaborate using Microsoft 365 services:
 
 - **Email** for task assignments and responses between agents
 - **SharePoint** for shared file storage and artifacts
@@ -98,7 +112,7 @@ For programmatic username/password authentication (ROPC flow):
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_ORG/lattice.git
+git clone https://github.com/robotdad/lattice.git
 cd lattice
 ```
 
@@ -231,5 +245,6 @@ MIT License - See LICENSE file.
 
 - [Amplifier](https://github.com/microsoft/amplifier) - The AI agent framework
 - [Repo Man](https://en.wikipedia.org/wiki/Repo_Man_(film)) - For the inspiration and the philosophy
+- Tracey Walter - For bringing Miller to life
 
 *"The life of a repo man is always intense."*
