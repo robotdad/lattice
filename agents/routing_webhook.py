@@ -8,6 +8,8 @@ Features:
 - Maintains per-agent conversation history
 - Realistic response delays
 - Multiple agents can respond to the same message
+- Auto-renewal of Graph subscriptions
+- Catch-up on missed messages when server restarts
 """
 
 import asyncio
@@ -15,7 +17,7 @@ import json
 import os
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +29,12 @@ import uvicorn
 
 app = FastAPI(title="Helping Hand Agent Webhook (Routing)")
 
+# Subscription management
+current_subscription_id: Optional[str] = None
+subscription_renewal_task: Optional[asyncio.Task] = None
+SUBSCRIPTION_DURATION_MINUTES = 55  # Renew before 60min expiry
+STATE_FILE: Path  # Defined after AGENTS_DIR
+
 # Configuration
 AGENTS_DIR = Path(__file__).parent
 LOG_FILE = AGENTS_DIR / "webhook.log"
@@ -36,6 +44,9 @@ DEFINITIONS_DIR = AGENTS_DIR / "definitions"
 
 # Ensure directories exist
 SESSIONS_DIR.mkdir(exist_ok=True)
+
+# State file for tracking last processed message
+STATE_FILE = AGENTS_DIR / ".webhook_state.json"
 
 # Azure AD / Graph config
 APP_ID = "760968bf-bbb6-423f-bff0-837057851664"
@@ -58,6 +69,35 @@ def log(msg: str):
     print(line)
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
+
+
+def load_state() -> dict:
+    """Load webhook state (last processed message time, subscription info)."""
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_state(state: dict):
+    """Save webhook state."""
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def get_ngrok_url() -> Optional[str]:
+    """Get the current ngrok public URL."""
+    try:
+        import httpx
+        response = httpx.get("http://localhost:4040/api/tunnels", timeout=5)
+        data = response.json()
+        tunnels = data.get("tunnels", [])
+        if tunnels:
+            return tunnels[0].get("public_url")
+    except Exception as e:
+        log(f"Could not get ngrok URL: {e}")
+    return None
 
 
 def load_agent_definitions():
@@ -222,6 +262,297 @@ async def get_app_token() -> Optional[str]:
         )
         data = response.json()
         return data.get("access_token")
+
+
+# =============================================================================
+# SUBSCRIPTION MANAGEMENT (Auto-renewal)
+# =============================================================================
+
+async def create_subscription(ngrok_url: str) -> Optional[str]:
+    """Create a new Graph subscription for chat messages."""
+    global current_subscription_id
+    
+    token = await get_app_token()
+    if not token:
+        log("Cannot create subscription: no app token")
+        return None
+    
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=SUBSCRIPTION_DURATION_MINUTES)
+    expiry_str = expiry.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://graph.microsoft.com/v1.0/subscriptions",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "changeType": "created",
+                "notificationUrl": f"{ngrok_url}/webhook",
+                "resource": "/chats/getAllMessages",
+                "expirationDateTime": expiry_str,
+                "clientState": "helpinghand-agents"
+            }
+        )
+        data = response.json()
+        
+        if "id" in data:
+            current_subscription_id = data["id"]
+            log(f"Created subscription {current_subscription_id}, expires {expiry_str}")
+            
+            # Save to state
+            state = load_state()
+            state["subscription_id"] = current_subscription_id
+            state["subscription_expiry"] = expiry_str
+            state["ngrok_url"] = ngrok_url
+            save_state(state)
+            
+            return current_subscription_id
+        else:
+            log(f"Failed to create subscription: {data.get('error', data)}")
+            return None
+
+
+async def renew_subscription() -> bool:
+    """Renew the current subscription."""
+    global current_subscription_id
+    
+    if not current_subscription_id:
+        log("No subscription to renew")
+        return False
+    
+    token = await get_app_token()
+    if not token:
+        return False
+    
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=SUBSCRIPTION_DURATION_MINUTES)
+    expiry_str = expiry.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.patch(
+            f"https://graph.microsoft.com/v1.0/subscriptions/{current_subscription_id}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json={"expirationDateTime": expiry_str}
+        )
+        
+        if response.status_code == 200:
+            log(f"Renewed subscription {current_subscription_id}, new expiry {expiry_str}")
+            
+            state = load_state()
+            state["subscription_expiry"] = expiry_str
+            save_state(state)
+            return True
+        else:
+            log(f"Failed to renew subscription: {response.status_code} {response.text[:200]}")
+            return False
+
+
+async def delete_subscription(sub_id: str) -> bool:
+    """Delete a subscription."""
+    token = await get_app_token()
+    if not token:
+        return False
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.delete(
+            f"https://graph.microsoft.com/v1.0/subscriptions/{sub_id}",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        return response.status_code in (200, 204)
+
+
+async def subscription_renewal_loop():
+    """Background task to renew subscription before expiry."""
+    global current_subscription_id
+    
+    renewal_interval = (SUBSCRIPTION_DURATION_MINUTES - 5) * 60  # Renew 5 min before expiry
+    
+    while True:
+        await asyncio.sleep(renewal_interval)
+        
+        if current_subscription_id:
+            log("Auto-renewing subscription...")
+            success = await renew_subscription()
+            
+            if not success:
+                # Try to recreate
+                log("Renewal failed, attempting to recreate subscription...")
+                ngrok_url = get_ngrok_url()
+                if ngrok_url:
+                    await create_subscription(ngrok_url)
+
+
+async def ensure_subscription():
+    """Ensure we have an active subscription, create if needed."""
+    global current_subscription_id, subscription_renewal_task
+    
+    ngrok_url = get_ngrok_url()
+    if not ngrok_url:
+        log("ERROR: ngrok not running! Cannot create subscription.")
+        log("Start ngrok with: ngrok http 8765")
+        return False
+    
+    # Check if we have an existing subscription
+    state = load_state()
+    existing_id = state.get("subscription_id")
+    
+    if existing_id:
+        # Try to renew existing
+        current_subscription_id = existing_id
+        if await renew_subscription():
+            log(f"Resumed existing subscription {existing_id}")
+        else:
+            # Create new
+            log("Existing subscription invalid, creating new...")
+            await create_subscription(ngrok_url)
+    else:
+        # Create new subscription
+        await create_subscription(ngrok_url)
+    
+    # Start renewal loop if not running
+    if subscription_renewal_task is None or subscription_renewal_task.done():
+        subscription_renewal_task = asyncio.create_task(subscription_renewal_loop())
+        log("Started subscription auto-renewal task")
+    
+    return current_subscription_id is not None
+
+
+# =============================================================================
+# CATCH-UP ON MISSED MESSAGES
+# =============================================================================
+
+async def get_all_chats(token: str) -> list[dict]:
+    """Get all chats the app can access."""
+    chats = []
+    url = "https://graph.microsoft.com/v1.0/chats"
+    
+    async with httpx.AsyncClient() as client:
+        while url:
+            response = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            data = response.json()
+            chats.extend(data.get("value", []))
+            url = data.get("@odata.nextLink")
+            if len(chats) > 100:  # Limit for safety
+                break
+    
+    return chats
+
+
+async def get_recent_messages(chat_id: str, token: str, since: Optional[str] = None) -> list[dict]:
+    """Get recent messages from a chat, optionally filtered by time."""
+    messages = []
+    
+    # Build URL with filter if we have a since timestamp
+    url = f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages"
+    params = {"$top": "50", "$orderby": "createdDateTime desc"}
+    
+    if since:
+        params["$filter"] = f"createdDateTime gt {since}"
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params
+        )
+        data = response.json()
+        messages = data.get("value", [])
+    
+    return messages
+
+
+async def catch_up_on_missed_messages():
+    """Check for and process messages that arrived while server was down."""
+    log("Checking for missed messages...")
+    
+    state = load_state()
+    last_processed = state.get("last_message_time")
+    
+    if not last_processed:
+        log("No previous state found, skipping catch-up")
+        return
+    
+    token = await get_app_token()
+    if not token:
+        log("Cannot catch up: no app token")
+        return
+    
+    # Get chats we're part of
+    try:
+        chats = await get_all_chats(token)
+        log(f"Found {len(chats)} chats to check for missed messages")
+        
+        missed_count = 0
+        
+        for chat in chats:
+            chat_id = chat.get("id")
+            if not chat_id:
+                continue
+            
+            # Get messages since last processed
+            messages = await get_recent_messages(chat_id, token, since=last_processed)
+            
+            for message in reversed(messages):  # Process oldest first
+                msg_id = message.get("id")
+                msg_key = f"{chat_id}:{msg_id}"
+                
+                # Skip if already processed
+                if msg_key in processed_messages:
+                    continue
+                
+                # Skip if from an agent
+                sender = message.get("from", {})
+                sender_user = sender.get("user", {})
+                sender_email = sender_user.get("userPrincipalName", "").lower()
+                sender_key = sender_email.split("@")[0].lower() if sender_email else ""
+                
+                if sender_key in agent_definitions:
+                    continue
+                
+                # Process this missed message
+                sender_name = sender_user.get("displayName", "Someone")
+                body = message.get("body", {}).get("content", "")
+                body_text = re.sub(r'<[^>]+>', '', body).strip()
+                
+                if body_text:
+                    missed_count += 1
+                    log(f"Processing missed message from {sender_name}: {body_text[:50]}...")
+                    
+                    # Mark as processed
+                    processed_messages.add(msg_key)
+                    
+                    # Route to agents (with shorter delays for catch-up)
+                    creds = load_credentials()
+                    channel_name = message.get("channelIdentity", {}).get("channelName", "Direct")
+                    
+                    for agent_key in agent_definitions.keys():
+                        if agent_key not in creds:
+                            continue
+                        
+                        should_respond, reason, delay = should_agent_respond(
+                            agent_key, body_text, sender_name, channel_name
+                        )
+                        
+                        if should_respond:
+                            # Shorter delay for catch-up (5-30s)
+                            catchup_delay = min(delay * 0.3, 30)
+                            asyncio.create_task(
+                                delayed_response(agent_key, chat_id, body_text, sender_name, catchup_delay)
+                            )
+        
+        if missed_count > 0:
+            log(f"Processed {missed_count} missed messages")
+        else:
+            log("No missed messages found")
+            
+    except Exception as e:
+        log(f"Error during catch-up: {e}")
+        import traceback
+        log(traceback.format_exc())
 
 
 async def get_user_token(agent_key: str, scopes: str = "Chat.ReadWrite") -> Optional[str]:
@@ -442,9 +773,17 @@ async def process_notification(data: dict):
                 
             log(f"Message from {sender_name}: {body_text[:80]}...")
             
+            # Update last message time for catch-up feature
+            msg_time = message.get("createdDateTime")
+            if msg_time:
+                state = load_state()
+                state["last_message_time"] = msg_time
+                save_state(state)
+            
             # Determine channel name (for routing)
-            # In 1:1 chats, channel_name might be empty
-            channel_name = message.get("channelIdentity", {}).get("channelName", "Direct")
+            # In 1:1 chats, channel_name might be empty or None
+            channel_identity = message.get("channelIdentity") or {}
+            channel_name = channel_identity.get("channelName", "Direct") or "Direct"
             
             # Route to agents
             creds = load_credentials()
@@ -512,8 +851,18 @@ async def delayed_response(
 
 @app.on_event("startup")
 async def startup():
-    """Load agent definitions on startup."""
+    """Load agent definitions and set up subscriptions on startup."""
     load_agent_definitions()
+    
+    # Set up subscription with auto-renewal
+    log("Setting up Graph subscription...")
+    success = await ensure_subscription()
+    
+    if success:
+        # Catch up on any missed messages
+        await catch_up_on_missed_messages()
+    else:
+        log("WARNING: Could not set up subscription. Make sure ngrok is running.")
 
 
 @app.get("/")
@@ -521,6 +870,7 @@ async def root():
     """Health check endpoint."""
     creds = load_credentials()
     agents_configured = [k for k in creds.keys() if not k.startswith("_")]
+    state = load_state()
     
     return {
         "status": "ok",
@@ -528,6 +878,9 @@ async def root():
         "agents_defined": list(agent_definitions.keys()),
         "agents_with_credentials": agents_configured,
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
+        "subscription_id": current_subscription_id,
+        "subscription_expiry": state.get("subscription_expiry"),
+        "last_message_time": state.get("last_message_time"),
         "quote": "A lot of people don't realize what's really going on."
     }
 
@@ -627,6 +980,40 @@ async def get_logs():
         lines = LOG_FILE.read_text().splitlines()[-100:]
         return {"logs": lines}
     return {"logs": []}
+
+
+@app.post("/subscription/renew")
+async def manual_renew():
+    """Manually renew the subscription."""
+    if current_subscription_id:
+        success = await renew_subscription()
+        return {"status": "renewed" if success else "failed", "subscription_id": current_subscription_id}
+    else:
+        ngrok_url = get_ngrok_url()
+        if ngrok_url:
+            sub_id = await create_subscription(ngrok_url)
+            return {"status": "created" if sub_id else "failed", "subscription_id": sub_id}
+        return {"status": "error", "message": "ngrok not running"}
+
+
+@app.post("/catchup")
+async def manual_catchup():
+    """Manually trigger catch-up on missed messages."""
+    await catch_up_on_missed_messages()
+    return {"status": "completed"}
+
+
+@app.get("/subscription")
+async def get_subscription_status():
+    """Get current subscription status."""
+    state = load_state()
+    return {
+        "subscription_id": current_subscription_id,
+        "expiry": state.get("subscription_expiry"),
+        "ngrok_url": state.get("ngrok_url"),
+        "last_message_time": state.get("last_message_time"),
+        "auto_renewal_active": subscription_renewal_task is not None and not subscription_renewal_task.done()
+    }
 
 
 if __name__ == "__main__":
