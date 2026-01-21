@@ -1,0 +1,23 @@
+# Sensitive credentials
+credentials.json
+.env
+*.token
+.app_token
+.*_token
+
+# Sessions (conversation history)
+sessions/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Pending/temp files
+pending_messages.json
+
+# Bundles (generated)
+bundles/
